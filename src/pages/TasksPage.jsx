@@ -1,60 +1,74 @@
-import { useEffect, useMemo, useState } from "react";
-import { useDispatch, useSelector } from "react-redux";
-import { useNavigate } from "react-router-dom";
-import { logout, selectAuth } from "../store/authSlice";
-import {
-  bulkSoftDelete,
-  fetchTasks,
-  selectTasks,
-  setFilter,
-} from "../store/tasksSlice";
-import { PRIORITIES, STATUSES, STATUS_LABEL } from "../utils/constants";
-import { PriorityBadge, StatusBadge } from "../components/Badge";
-import Spinner from "../components/Spinner";
-import TaskFormModal from "../components/TaskFormModal";
-import TaskDetailModal from "../components/TaskDetailModal";
-import SummaryModal from "../components/SummaryModal";
-import {
-  PlusIcon,
-  PencilIcon,
-  TrashIcon,
-  ChartIcon,
-  LogoutIcon,
-} from "../icons";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
+import { useNavigate } from 'react-router-dom';
+import { logout, selectAuth } from '../store/authSlice';
+import { tasksApi } from '../api/tasksApi';
+import { useFetch } from '../hooks/useFetch';
+import { extractError } from '../utils/errors';
+import { PRIORITIES, STATUSES, STATUS_LABEL } from '../utils/constants';
+import { nextSort, sortTasks } from '../utils/sort';
+import { PriorityBadge, StatusBadge } from '../components/Badge';
+import Spinner from '../components/Spinner';
+import TaskFormModal from '../components/TaskFormModal';
+import TaskDetailModal from '../components/TaskDetailModal';
+import SummaryModal from '../components/SummaryModal';
+import { ChartIcon, LogoutIcon, PencilIcon, PlusIcon, TrashIcon } from '../icons';
 
 export default function TasksPage() {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const { userName } = useSelector(selectAuth);
-  const { items, filters, listStatus, error } = useSelector(selectTasks);
-  const loading = listStatus === "loading";
 
+  const [filters, setFilters] = useState({ status: '', priority: '' });
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [detailId, setDetailId] = useState(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
+  const [sort, setSort] = useState({ key: null, dir: 'asc' });
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState(null);
 
-  // Re-fetch when filters change. The server does the filtering.
-  useEffect(() => {
-    dispatch(fetchTasks(filters));
-  }, [dispatch, filters]);
+  // ──────────────────────────────────────────────────────────────────────
+  // List fetch via useFetch.
+  //
+  // The fetcher's identity changes only when `filters` change, so useFetch
+  // automatically:
+  //   • aborts the in-flight request if filters change before the response
+  //     arrives (race-condition guard),
+  //   • retries transient errors (network / 5xx / 429) with backoff,
+  //   • discards stale responses via its sequence counter, and
+  //   • cleans up on unmount.
+  // ──────────────────────────────────────────────────────────────────────
+  const listFetcher = useCallback((signal) => tasksApi.list(filters, signal), [filters]);
+  const { data, error: fetchError, loading, refetch } = useFetch(listFetcher);
 
-  // Reset selection when the visible row set changes.
-  useEffect(() => {
-    const visible = new Set(items.map((t) => t.id));
-    setSelectedIds(
-      (prev) => new Set([...prev].filter((id) => visible.has(id))),
-    );
-  }, [items]);
+  // Visible rows = server-filtered items, optionally sorted client-side.
+  const visibleItems = useMemo(() => sortTasks(data ?? [], sort.key, sort.dir), [data, sort]);
+
+  // Derive the effective selection at render time instead of pruning state
+  // in an effect — avoids the cascading-render anti-pattern flagged by
+  // react-hooks. Selecting a row that later disappears is silently dropped.
+  const visibleIdSet = useMemo(() => new Set(visibleItems.map((t) => t.id)), [visibleItems]);
+  const effectiveSelectedIds = useMemo(
+    () => new Set([...selectedIds].filter((id) => visibleIdSet.has(id))),
+    [selectedIds, visibleIdSet],
+  );
 
   const allChecked =
-    items.length > 0 && items.every((t) => selectedIds.has(t.id));
-  const someChecked = selectedIds.size > 0 && !allChecked;
+    visibleItems.length > 0 && visibleItems.every((t) => effectiveSelectedIds.has(t.id));
+  const someChecked = effectiveSelectedIds.size > 0 && !allChecked;
+
+  // Indeterminate is a DOM-only property (not a React prop). Apply via ref
+  // in an effect so the change happens after commit, not during render.
+  const selectAllRef = useRef(null);
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someChecked;
+  }, [someChecked]);
 
   const toggleAll = () => {
     if (allChecked) setSelectedIds(new Set());
-    else setSelectedIds(new Set(items.map((t) => t.id)));
+    else setSelectedIds(new Set(visibleItems.map((t) => t.id)));
   };
 
   const toggleOne = (id) => {
@@ -67,15 +81,24 @@ export default function TasksPage() {
   };
 
   const handleBulkDelete = async () => {
-    if (selectedIds.size === 0) return;
-    if (!window.confirm(`Soft-delete ${selectedIds.size} task(s)?`)) return;
-    await dispatch(bulkSoftDelete([...selectedIds]));
-    setSelectedIds(new Set());
+    if (effectiveSelectedIds.size === 0) return;
+    if (!window.confirm(`Soft-delete ${effectiveSelectedIds.size} task(s)?`)) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      await tasksApi.softDelete([...effectiveSelectedIds]);
+      setSelectedIds(new Set());
+      refetch();
+    } catch (e) {
+      setBulkError(extractError(e, 'Failed to delete tasks.'));
+    } finally {
+      setBulkBusy(false);
+    }
   };
 
   const handleLogout = () => {
     dispatch(logout());
-    navigate("/login", { replace: true });
+    navigate('/login', { replace: true });
   };
 
   const openCreate = () => {
@@ -88,10 +111,15 @@ export default function TasksPage() {
     setFormOpen(true);
   };
 
+  const onSort = (key) => setSort((cur) => nextSort(cur, key));
+
   const counters = useMemo(
-    () => ({ total: items.length, selected: selectedIds.size }),
-    [items.length, selectedIds.size],
+    () => ({ total: visibleItems.length, selected: effectiveSelectedIds.size }),
+    [visibleItems.length, effectiveSelectedIds.size],
   );
+
+  const errorMessage =
+    bulkError || (fetchError ? extractError(fetchError, 'Failed to load tasks.') : null);
 
   return (
     <div className="min-h-screen">
@@ -101,15 +129,12 @@ export default function TasksPage() {
             <div className="w-8 h-8 rounded-lg bg-brand-700 text-white flex items-center justify-center text-sm font-semibold">
               T
             </div>
-            <h1 className="text-base font-semibold text-slate-900">
-              Task Management
-            </h1>
+            <h1 className="text-base font-semibold text-slate-900">Task Management</h1>
           </div>
           <div className="flex items-center gap-3">
             {userName && (
               <span className="text-sm text-slate-500 hidden sm:inline">
-                Signed in as{" "}
-                <span className="text-slate-800 font-medium">{userName}</span>
+                Signed in as <span className="text-slate-800 font-medium">{userName}</span>
               </span>
             )}
             <button onClick={handleLogout} className="btn-secondary">
@@ -125,19 +150,14 @@ export default function TasksPage() {
           <div>
             <h2 className="text-xl font-semibold text-slate-900">Tasks</h2>
             <p className="text-sm text-slate-500">
-              {counters.total} {counters.total === 1 ? "task" : "tasks"}
+              {counters.total} {counters.total === 1 ? 'task' : 'tasks'}
               {counters.selected > 0 && (
-                <span className="ml-2 text-brand-700">
-                  ({counters.selected} selected)
-                </span>
+                <span className="ml-2 text-brand-700">({counters.selected} selected)</span>
               )}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              className="btn-secondary"
-              onClick={() => setSummaryOpen(true)}
-            >
+            <button className="btn-secondary" onClick={() => setSummaryOpen(true)}>
               <ChartIcon />
               View summary
             </button>
@@ -151,15 +171,11 @@ export default function TasksPage() {
         <div className="card">
           <div className="px-4 py-3 border-b border-slate-200 flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-2">
-              <label className="text-xs uppercase tracking-wide text-slate-500">
-                Status
-              </label>
+              <label className="text-xs uppercase tracking-wide text-slate-500">Status</label>
               <select
                 className="input py-1.5 w-40"
                 value={filters.status}
-                onChange={(e) =>
-                  dispatch(setFilter({ status: e.target.value }))
-                }
+                onChange={(e) => setFilters((f) => ({ ...f, status: e.target.value }))}
               >
                 <option value="">All</option>
                 {STATUSES.map((s) => (
@@ -170,15 +186,11 @@ export default function TasksPage() {
               </select>
             </div>
             <div className="flex items-center gap-2">
-              <label className="text-xs uppercase tracking-wide text-slate-500">
-                Priority
-              </label>
+              <label className="text-xs uppercase tracking-wide text-slate-500">Priority</label>
               <select
                 className="input py-1.5 w-40"
                 value={filters.priority}
-                onChange={(e) =>
-                  dispatch(setFilter({ priority: e.target.value }))
-                }
+                onChange={(e) => setFilters((f) => ({ ...f, priority: e.target.value }))}
               >
                 <option value="">All</option>
                 {PRIORITIES.map((p) => (
@@ -188,21 +200,22 @@ export default function TasksPage() {
                 ))}
               </select>
             </div>
-            {(filters.status || filters.priority) && (
+            {(filters.status || filters.priority || sort.key) && (
               <button
                 className="text-xs text-slate-500 hover:text-slate-700 underline"
-                onClick={() =>
-                  dispatch(setFilter({ status: "", priority: "" }))
-                }
+                onClick={() => {
+                  setFilters({ status: '', priority: '' });
+                  setSort({ key: null, dir: 'asc' });
+                }}
               >
                 Clear filters
               </button>
             )}
             <div className="ml-auto flex items-center gap-2">
-              {selectedIds.size > 0 && (
-                <button className="btn-danger" onClick={handleBulkDelete}>
+              {effectiveSelectedIds.size > 0 && (
+                <button className="btn-danger" onClick={handleBulkDelete} disabled={bulkBusy}>
                   <TrashIcon />
-                  Delete selected
+                  {bulkBusy ? 'Deleting…' : 'Delete selected'}
                 </button>
               )}
             </div>
@@ -217,26 +230,16 @@ export default function TasksPage() {
                       type="checkbox"
                       className="h-4 w-4 rounded border-slate-300 text-brand-700 focus:ring-brand-500"
                       checked={allChecked}
-                      ref={(el) => el && (el.indeterminate = someChecked)}
+                      ref={selectAllRef}
                       onChange={toggleAll}
                       aria-label="Select all"
                     />
                   </th>
-                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">
-                    Title
-                  </th>
-                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">
-                    Status
-                  </th>
-                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">
-                    Priority
-                  </th>
-                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">
-                    Assigned
-                  </th>
-                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">
-                    Modified
-                  </th>
+                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">Title</th>
+                  <SortableHeader label="Status" col="status" sort={sort} onSort={onSort} />
+                  <SortableHeader label="Priority" col="priority" sort={sort} onSort={onSort} />
+                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">Assigned</th>
+                  <th className="px-4 py-2.5 text-left font-medium text-slate-600">Modified</th>
                   <th className="px-4 py-2.5 text-right font-medium text-slate-600 w-16">
                     Actions
                   </th>
@@ -245,34 +248,39 @@ export default function TasksPage() {
               <tbody className="divide-y divide-slate-100 bg-white">
                 {loading && (
                   <tr>
-                    <td
-                      colSpan={7}
-                      className="px-4 py-8 text-center text-slate-400"
-                    >
+                    <td colSpan={7} className="px-4 py-8 text-center text-slate-400">
                       <span className="inline-flex items-center gap-2">
                         <Spinner /> Loading tasks…
                       </span>
                     </td>
                   </tr>
                 )}
-                {!loading && items.length === 0 && (
+                {!loading && errorMessage && (
                   <tr>
-                    <td
-                      colSpan={7}
-                      className="px-4 py-12 text-center text-slate-400"
-                    >
+                    <td colSpan={7} className="px-4 py-8 text-center">
+                      <p className="text-sm text-rose-600 mb-2">{errorMessage}</p>
+                      <button className="btn-secondary" onClick={refetch}>
+                        Try again
+                      </button>
+                    </td>
+                  </tr>
+                )}
+                {!loading && !errorMessage && visibleItems.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-12 text-center text-slate-400">
                       No tasks match the current filters.
                     </td>
                   </tr>
                 )}
                 {!loading &&
-                  items.map((t) => (
+                  !errorMessage &&
+                  visibleItems.map((t) => (
                     <tr key={t.id} className="hover:bg-slate-50/70">
                       <td className="px-4 py-3">
                         <input
                           type="checkbox"
                           className="h-4 w-4 rounded border-slate-300 text-brand-700 focus:ring-brand-500"
-                          checked={selectedIds.has(t.id)}
+                          checked={effectiveSelectedIds.has(t.id)}
                           onChange={() => toggleOne(t.id)}
                           aria-label={`Select task ${t.id}`}
                         />
@@ -282,6 +290,7 @@ export default function TasksPage() {
                           onClick={() => setDetailId(t.id)}
                           className="font-medium text-slate-900 hover:text-brand-700 text-left"
                         >
+                          {/* Rendered as text — XSS-safe. Never use dangerouslySetInnerHTML here. */}
                           {t.title}
                         </button>
                         <div className="text-xs text-slate-500">#{t.id}</div>
@@ -293,9 +302,7 @@ export default function TasksPage() {
                         <PriorityBadge value={t.priority} />
                       </td>
                       <td className="px-4 py-3 text-slate-700">
-                        {t.assignedTo || (
-                          <span className="text-slate-400">—</span>
-                        )}
+                        {t.assignedTo || <span className="text-slate-400">—</span>}
                       </td>
                       <td className="px-4 py-3 text-slate-500 tabular-nums">
                         {new Date(t.modifiedDate).toLocaleDateString()}
@@ -315,12 +322,6 @@ export default function TasksPage() {
               </tbody>
             </table>
           </div>
-
-          {error && !loading && (
-            <div className="px-4 py-3 border-t border-slate-200 text-sm text-rose-700 bg-rose-50">
-              {error}
-            </div>
-          )}
         </div>
       </main>
 
@@ -328,7 +329,7 @@ export default function TasksPage() {
         open={formOpen}
         onClose={() => setFormOpen(false)}
         editing={editing}
-        filters={filters}
+        onSaved={refetch}
       />
       <TaskDetailModal
         open={detailId !== null}
@@ -337,5 +338,27 @@ export default function TasksPage() {
       />
       <SummaryModal open={summaryOpen} onClose={() => setSummaryOpen(false)} />
     </div>
+  );
+}
+
+function SortableHeader({ label, col, sort, onSort }) {
+  const active = sort.key === col;
+  const arrow = active ? (sort.dir === 'asc' ? '▲' : '▼') : '↕';
+  return (
+    <th
+      className="px-4 py-2.5 text-left font-medium text-slate-600"
+      aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(col)}
+        className="inline-flex items-center gap-1 hover:text-slate-900"
+      >
+        {label}
+        <span className={`text-[10px] ${active ? 'text-brand-700' : 'text-slate-300'}`}>
+          {arrow}
+        </span>
+      </button>
+    </th>
   );
 }
