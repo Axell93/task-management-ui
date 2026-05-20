@@ -1,27 +1,41 @@
-import { useEffect, useMemo } from 'react';
-import { useDispatch, useSelector } from 'react-redux';
+import { useCallback, useMemo } from 'react';
 import Modal from './Modal';
 import Spinner from './Spinner';
 import { PriorityBadge, StatusBadge } from './Badge';
-import { fetchSummary, selectTasks } from '../store/tasksSlice';
+import { tasksApi } from '../api/tasksApi';
+import { useFetch } from '../hooks/useFetch';
+import { extractError } from '../utils/errors';
 
 export default function SummaryModal({ open, onClose }) {
-  const dispatch = useDispatch();
-  const { summary } = useSelector(selectTasks);
+  const fetcher = useCallback((signal) => tasksApi.summary(signal), []);
+  const { data: summary, error, loading, refetch } = useFetch(fetcher, { immediate: open });
 
-  useEffect(() => {
-    if (open) dispatch(fetchSummary());
-  }, [open, dispatch]);
-
-  const total = useMemo(() => summary.reduce((sum, r) => sum + r.count, 0), [summary]);
+  const total = useMemo(() => (summary || []).reduce((sum, r) => sum + r.count, 0), [summary]);
 
   return (
     <Modal open={open} onClose={onClose} title="Task summary" size="lg">
-      {summary.length === 0 ? (
+      {loading && (
         <div className="flex items-center justify-center py-10 text-slate-400">
           <Spinner className="w-6 h-6" />
         </div>
-      ) : (
+      )}
+
+      {!loading && error && (
+        <div className="py-6 text-center">
+          <p className="text-sm text-rose-600 mb-3">
+            {extractError(error, 'Failed to load summary.')}
+          </p>
+          <button className="btn-secondary" onClick={refetch}>
+            Try again
+          </button>
+        </div>
+      )}
+
+      {!loading && !error && summary && summary.length === 0 && (
+        <p className="text-center text-slate-400 py-8">No data to summarise yet.</p>
+      )}
+
+      {!loading && !error && summary && summary.length > 0 && (
         <>
           <div className="flex items-baseline justify-between mb-4">
             <p className="text-sm text-slate-500">

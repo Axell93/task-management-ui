@@ -1,40 +1,46 @@
-import { createSlice, createAsyncThunk } from "@reduxjs/toolkit";
-import { authApi } from "../api/authApi";
-import { extractError } from "../utils/errors";
+import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
+import { authApi } from '../api/authApi';
+import { extractError } from '../utils/errors';
+import { authStorage } from '../utils/storage';
+import { isTokenExpired } from '../utils/jwt';
 
 // Thunks (Redux Toolkit ships with redux-thunk; createAsyncThunk uses it).
-export const loginThunk = createAsyncThunk(
-  "auth/login",
-  async (payload, { rejectWithValue }) => {
-    try {
-      return await authApi.login(payload);
-    } catch (err) {
-      return rejectWithValue(extractError(err, "Login failed."));
-    }
-  },
-);
+export const loginThunk = createAsyncThunk('auth/login', async (payload, { rejectWithValue }) => {
+  try {
+    return await authApi.login(payload);
+  } catch (err) {
+    return rejectWithValue(extractError(err, 'Login failed.'));
+  }
+});
 
 export const registerThunk = createAsyncThunk(
-  "auth/register",
+  'auth/register',
   async (payload, { rejectWithValue }) => {
     try {
       return await authApi.register(payload);
     } catch (err) {
-      return rejectWithValue(extractError(err, "Registration failed."));
+      return rejectWithValue(extractError(err, 'Registration failed.'));
     }
   },
 );
 
+// Bootstrap: if a token persisted from a previous session is already
+// expired, treat the user as logged out so the SPA never renders
+// "authenticated" with a dead token.
+const bootstrapToken = authStorage.getToken();
+const bootstrapValid = bootstrapToken && !isTokenExpired(bootstrapToken);
+if (bootstrapToken && !bootstrapValid) authStorage.clear();
+
 const initial = {
-  token: localStorage.getItem("token") || null,
-  expiresAt: localStorage.getItem("expiresAt") || null,
-  userName: localStorage.getItem("userName") || null,
-  status: "idle",
+  token: bootstrapValid ? bootstrapToken : null,
+  expiresAt: bootstrapValid ? authStorage.getExpiresAt() : null,
+  userName: bootstrapValid ? authStorage.getUserName() : null,
+  status: 'idle',
   error: null,
 };
 
 const authSlice = createSlice({
-  name: "auth",
+  name: 'auth',
   initialState: initial,
   reducers: {
     logout: (state) => {
@@ -42,9 +48,7 @@ const authSlice = createSlice({
       state.expiresAt = null;
       state.userName = null;
       state.error = null;
-      localStorage.removeItem("token");
-      localStorage.removeItem("expiresAt");
-      localStorage.removeItem("userName");
+      authStorage.clear();
     },
     clearError: (state) => {
       state.error = null;
@@ -52,21 +56,23 @@ const authSlice = createSlice({
   },
   extraReducers: (builder) => {
     const onPending = (state) => {
-      state.status = "loading";
+      state.status = 'loading';
       state.error = null;
     };
     const onFulfilled = (state, action) => {
-      state.status = "succeeded";
+      state.status = 'succeeded';
       state.token = action.payload.token;
       state.expiresAt = action.payload.expiresAt;
       state.userName = action.meta.arg.userName;
-      localStorage.setItem("token", action.payload.token);
-      localStorage.setItem("expiresAt", action.payload.expiresAt);
-      localStorage.setItem("userName", action.meta.arg.userName);
+      authStorage.set({
+        token: action.payload.token,
+        expiresAt: action.payload.expiresAt,
+        userName: action.meta.arg.userName,
+      });
     };
     const onRejected = (state, action) => {
-      state.status = "failed";
-      state.error = action.payload || action.error?.message || "Auth failed.";
+      state.status = 'failed';
+      state.error = action.payload || action.error?.message || 'Auth failed.';
     };
     builder
       .addCase(loginThunk.pending, onPending)

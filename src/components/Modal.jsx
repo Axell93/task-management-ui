@@ -39,7 +39,11 @@ export default function Modal({ open, onClose, title, children, footer, size = '
           </button>
         </div>
         <div className="px-6 py-4 overflow-y-auto">{children}</div>
-        {footer ? <div className="px-6 py-3 border-t border-slate-200 bg-slate-50/50 rounded-b-lg flex justify-end gap-2">{footer}</div> : null}
+        {footer ? (
+          <div className="px-6 py-3 border-t border-slate-200 bg-slate-50/50 rounded-b-lg flex justify-end gap-2">
+            {footer}
+          </div>
+        ) : null}
       </div>
     </div>
   );
